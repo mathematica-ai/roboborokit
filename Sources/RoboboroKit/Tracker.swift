@@ -46,45 +46,52 @@ public final class RoboboroTracker: @unchecked Sendable {
         storage customStorage: RoboboroStoring? = nil,
         transport customTransport: RoboboroTransporting? = nil
     ) async -> RoboboroTracker? {
-        if active && !destroyed && !optedOut { return self }
-
         let siteId = config.siteId.trimmingCharacters(in: .whitespacesAndNewlines)
         let apiBase = config.apiBase.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !siteId.isEmpty, !apiBase.isEmpty else { return nil }
-
-        if let customStorage { self.storage = customStorage }
-        if let customTransport { self.transport = customTransport }
-
-        var resolved = config
-        resolved.siteId = siteId
-        resolved.apiBase = apiBase
-        self.config = resolved
-
-        optedOut = storage.get(RoboboroCore.optOutKey) == "1"
-        let signals = RoboboroPrivacySignals(gpc: false, dnt: false, optedOut: optedOut)
-        guard RoboboroConsent.granted(signals, hasConsent: config.hasConsent) else {
-            return nil
-        }
-
-        destroyed = false
-        active = true
-        queue = []
-        breadcrumbs = []
-        user = nil
-        screen = nil
+        if withLock({ active && !destroyed && !optedOut }) { return self }
 
 #if canImport(UIKit)
-        systemVersion = await MainActor.run { UIDevice.current.systemVersion }
-        deviceOS = await MainActor.run { UIDevice.current.userInterfaceIdiom == .pad ? "ipados" : "ios" }
+        let version = await MainActor.run { UIDevice.current.systemVersion }
+        let os = await MainActor.run { UIDevice.current.userInterfaceIdiom == .pad ? "ipados" : "ios" }
 #else
-        systemVersion = ProcessInfo.processInfo.operatingSystemVersionString
-        deviceOS = "macos"
+        let version = ProcessInfo.processInfo.operatingSystemVersionString
+        let os = "macos"
 #endif
 
+        let began: Bool = withLock {
+            if active && !destroyed && !optedOut { return false }
+            if let customStorage { storage = customStorage }
+            if let customTransport { transport = customTransport }
+            var resolved = config
+            resolved.siteId = siteId
+            resolved.apiBase = apiBase
+            self.config = resolved
+            optedOut = storage.get(RoboboroCore.optOutKey) == "1"
+            let signals = RoboboroPrivacySignals(gpc: false, dnt: false, optedOut: optedOut)
+            guard RoboboroConsent.granted(signals, hasConsent: config.hasConsent) else {
+                return false
+            }
+            destroyed = false
+            active = true
+            queue = []
+            breadcrumbs = []
+            user = nil
+            screen = nil
+            deviceOS = os
+            systemVersion = version
+            return true
+        }
+        guard began else {
+            return withLock { active && !destroyed && !optedOut } ? self : nil
+        }
+
+        let visitor = ensureVisitor()
         push(type: .session, message: "session_start", extra: [
             "os": .string(deviceOS),
             "system_version": systemVersion.map { .string($0) } ?? .null,
             "storage_persistent": .bool(storage.isPersistent),
+            "visitor_id": .string(visitor),
         ])
 
         startTimer()
@@ -93,13 +100,12 @@ public final class RoboboroTracker: @unchecked Sendable {
     }
 
     public func destroy() {
-        lock.lock()
-        flushTimer?.invalidate()
-        flushTimer = nil
-        destroyed = true
-        active = false
-        queue.removeAll()
-        lock.unlock()
+        invalidateTimer()
+        withLock {
+            destroyed = true
+            active = false
+            queue.removeAll()
+        }
 #if canImport(UIKit)
         NotificationCenter.default.removeObserver(self)
 #endif
@@ -121,11 +127,12 @@ public final class RoboboroTracker: @unchecked Sendable {
 
     public func optOut() {
         storage.set(RoboboroCore.optOutKey, "1")
-        lock.lock()
-        optedOut = true
-        queue.removeAll()
-        lock.unlock()
         storage.remove(RoboboroCore.pendingBufferKey)
+        withLock {
+            optedOut = true
+            queue.removeAll()
+        }
+        invalidateTimer()
     }
 
     // MARK: Tracking API
@@ -222,6 +229,8 @@ public final class RoboboroTracker: @unchecked Sendable {
         let snapshot = prepared.events
         let cfg = prepared.config
         guard let cfg, !snapshot.isEmpty else { return }
+        // Opt-out wins over a batch that was already taken off the queue.
+        guard !isOptedOut else { return }
         guard let url = URL(string: RoboboroURL.ingest(cfg.apiBase)) else {
             requeue(snapshot)
             return
@@ -229,8 +238,11 @@ public final class RoboboroTracker: @unchecked Sendable {
 
         var remaining = snapshot
         while !remaining.isEmpty {
+            guard !isOptedOut else { return }
             let n = min(RoboboroCore.maxBatchSize, remaining.count)
             let chunk = Array(remaining.prefix(n))
+            // Written before the request, so a kill mid-flight retries next launch.
+            savePending(remaining)
             let payload = RoboboroBatch(
                 siteId: cfg.siteId,
                 organisationSlug: cfg.organisationSlug,
@@ -244,8 +256,13 @@ public final class RoboboroTracker: @unchecked Sendable {
                 let body = try RoboboroPost.encode(batch: payload)
                 try await transport.send(url: url, apiKey: cfg.apiKey, body: body)
                 remaining.removeFirst(n)
+                if remaining.isEmpty {
+                    clearPending()
+                } else {
+                    savePending(remaining)
+                }
             } catch {
-                requeue(remaining)
+                if !isOptedOut { requeue(remaining) }
                 return
             }
         }
@@ -289,6 +306,22 @@ public final class RoboboroTracker: @unchecked Sendable {
         withLock { active && !destroyed && !optedOut }
     }
 
+    private var isOptedOut: Bool {
+        withLock { optedOut }
+    }
+
+    /// Stable device id for this install. Not an account, and not an email.
+    private func ensureVisitor() -> String {
+        if let existing = storage.get(RoboboroCore.visitorKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !existing.isEmpty {
+            return existing
+        }
+        let created = RoboboroIDs.generateId(prefix: "rbv")
+        storage.set(RoboboroCore.visitorKey, created)
+        return created
+    }
+
     private func nowMs() -> Int64 {
         Int64(Date().timeIntervalSince1970 * 1000)
     }
@@ -307,8 +340,8 @@ public final class RoboboroTracker: @unchecked Sendable {
         runId: String? = nil,
         videoUrl: String? = nil
     ) {
-        guard isRunnable, let cfg = config else { return }
-        withLock {
+        let event: RoboboroEvent? = withLock {
+        guard active && !destroyed && !optedOut, let cfg = config else { return nil }
         let event = RoboboroEvent(
             eventId: RoboboroIDs.generateId(),
             type: type,
@@ -339,7 +372,9 @@ public final class RoboboroTracker: @unchecked Sendable {
         if queue.count > RoboboroCore.maxPending {
             queue = Array(queue.suffix(RoboboroCore.maxPending))
         }
+        return event
         }
+        guard event != nil else { return }
     }
 
     private func requeue(_ events: [RoboboroEvent]) {
@@ -373,7 +408,7 @@ public final class RoboboroTracker: @unchecked Sendable {
     }
 
     private func startTimer() {
-        let interval = config?.flushInterval ?? RoboboroCore.defaultFlushInterval
+        let interval = withLock { config?.flushInterval ?? RoboboroCore.defaultFlushInterval }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.flushTimer?.invalidate()
@@ -383,8 +418,25 @@ public final class RoboboroTracker: @unchecked Sendable {
         }
     }
 
+    private func invalidateTimer() {
+        let work = {
+            self.flushTimer?.invalidate()
+            self.flushTimer = nil
+        }
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.sync(execute: work)
+        }
+    }
+
     private func observeAppLifecycle() {
 #if canImport(UIKit)
+        NotificationCenter.default.removeObserver(
+            self,
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(didEnterBackground),
@@ -396,7 +448,29 @@ public final class RoboboroTracker: @unchecked Sendable {
 
 #if canImport(UIKit)
     @objc private func didEnterBackground() {
-        Task { await flush() }
+        let application = UIApplication.shared
+        let box = BackgroundTaskBox()
+        box.id = application.beginBackgroundTask(withName: "roboboro.flush") {
+            let ending = box.id
+            box.id = .invalid
+            if ending != .invalid {
+                application.endBackgroundTask(ending)
+            }
+        }
+        Task {
+            await flush()
+            await MainActor.run {
+                let ending = box.id
+                box.id = .invalid
+                if ending != .invalid {
+                    application.endBackgroundTask(ending)
+                }
+            }
+        }
+    }
+
+    private final class BackgroundTaskBox: @unchecked Sendable {
+        var id: UIBackgroundTaskIdentifier = .invalid
     }
 #endif
 }

@@ -12,6 +12,7 @@ final class FakeTransport: RoboboroTransporting, @unchecked Sendable {
     private var _calls: [Call] = []
     var status: Int = 202
     var error: Error?
+    var onSend: (@Sendable () -> Void)?
 
     var calls: [Call] {
         lock.lock(); defer { lock.unlock() }
@@ -30,6 +31,10 @@ final class FakeTransport: RoboboroTransporting, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         _calls.append(Call(url: url, apiKey: apiKey, body: body))
+        let hook = onSend
+        lock.unlock()
+        hook?()
+        lock.lock()
         return (status, error)
     }
 }
@@ -188,6 +193,44 @@ final class RoboboroKitTests: XCTestCase {
             transport: transport
         )
         XCTAssertNil(again)
+    }
+
+    func testFlushKeepsTheBatchUntilThePostSucceeds() async throws {
+        let tracker = await startTracker()
+        tracker?.captureMessage("kept")
+        transport.onSend = { [storage] in
+            let raw = storage?.get(RoboboroCore.pendingBufferKey) ?? ""
+            XCTAssertTrue(raw.contains("kept"))
+        }
+        await tracker?.flush()
+        XCTAssertNil(storage.get(RoboboroCore.pendingBufferKey))
+    }
+
+    func testSessionStoresAVisitorId() async throws {
+        let tracker = await startTracker()
+        await tracker?.flush()
+        let body = try JSONDecoder().decode(RoboboroBatch.self, from: XCTUnwrap(transport.calls.first).body)
+        let session = try XCTUnwrap(body.batch.first { $0.message == "session_start" })
+        let stored = try XCTUnwrap(storage.get(RoboboroCore.visitorKey))
+        XCTAssertEqual(session.data?["visitor_id"], .string(stored))
+        XCTAssertTrue(stored.hasPrefix("rbv_"))
+    }
+
+    func testRedirectStaysOnHttpsAndTheSameHost() {
+        let bff = URL(string: "https://www.principia1.com/api/v1/roboboro/ingest")
+        XCTAssertTrue(RoboboroRedirect.follows(
+            from: bff,
+            to: URL(string: "https://www.principia1.com/api/v1/roboboro/ingest/")
+        ))
+        XCTAssertFalse(RoboboroRedirect.follows(
+            from: bff,
+            to: URL(string: "http://www.principia1.com/api/v1/roboboro/ingest")
+        ))
+        XCTAssertFalse(RoboboroRedirect.follows(
+            from: bff,
+            to: URL(string: "https://evil.example/ingest")
+        ))
+        XCTAssertFalse(RoboboroRedirect.follows(from: bff, to: nil))
     }
 
     func testConsentCallbackCanBlockInit() async {

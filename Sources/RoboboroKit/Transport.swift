@@ -9,11 +9,54 @@ public protocol RoboboroTransporting: AnyObject, Sendable {
     func send(url: URL, apiKey: String?, body: Data) async throws
 }
 
+/// A redirect is followed only when both URLs are https and the host is unchanged.
+public enum RoboboroRedirect {
+    public static func follows(from: URL?, to: URL?) -> Bool {
+        guard let from, let to else { return false }
+        guard from.scheme?.lowercased() == "https", to.scheme?.lowercased() == "https" else {
+            return false
+        }
+        guard let fromHost = from.host?.lowercased(), let toHost = to.host?.lowercased() else {
+            return false
+        }
+        return fromHost == toHost
+    }
+}
+
+private final class RoboboroRedirector: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest
+    ) async -> URLRequest? {
+        guard RoboboroRedirect.follows(from: task.originalRequest?.url, to: request.url) else {
+            return nil
+        }
+        return request
+    }
+}
+
 public final class RoboboroURLSessionTransport: RoboboroTransporting, @unchecked Sendable {
     private let session: URLSession
+    /// Keeps the redirect delegate alive for the session.
+    private let redirector: RoboboroRedirector?
 
-    public init(session: URLSession = .shared) {
+    /// Ephemeral session: no cookies, no cache, and no redirect onto another host.
+    public init() {
+        let redirector = RoboboroRedirector()
+        let config = URLSessionConfiguration.ephemeral
+        config.httpCookieStorage = nil
+        config.httpShouldSetCookies = false
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.timeoutIntervalForRequest = 10
+        self.redirector = redirector
+        self.session = URLSession(configuration: config, delegate: redirector, delegateQueue: nil)
+    }
+
+    public init(session: URLSession) {
         self.session = session
+        self.redirector = nil
     }
 
     public func send(url: URL, apiKey: String?, body: Data) async throws {
@@ -31,6 +74,7 @@ public final class RoboboroURLSessionTransport: RoboboroTransporting, @unchecked
         }
         // 202 (Next BFF) and 2xx from sublime-go are success. Anything else
         // must requeue — fetch-style "no throw on 500" would drop events.
+        // A refused redirect completes as the original 3xx, which requeues too.
         guard (200..<300).contains(http.statusCode) else {
             throw RoboboroTransportError.http(http.statusCode)
         }
