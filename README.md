@@ -36,7 +36,7 @@ git@github.com-math:mathematica-ai/roboborokit.git
 
 ```swift
 dependencies: [
-  .package(url: "git@github.com-math:mathematica-ai/roboborokit.git", from: "0.1.0"),
+  .package(url: "git@github.com-math:mathematica-ai/roboborokit.git", from: "0.2.0"),
 ],
 targets: [
   .target(name: "YourApp", dependencies: ["RoboboroKit"]),
@@ -69,7 +69,11 @@ RoboboroTracker.shared.addBreadcrumb(category: "sync", message: "knowledge_start
 
 Task { await RoboboroTracker.shared.flush() }
 RoboboroTracker.shared.optOut()
+RoboboroTracker.shared.optIn() // clears the opt-out; call start again to resume
 ```
+
+`trackScreen` sends no event of its own: it adds a `navigation` breadcrumb and
+sets the `screen` carried by later events.
 
 `apiBase` is **required**. There is no silent production default.
 
@@ -85,6 +89,27 @@ RoboboroTracker.shared.optOut()
 | `release` | — | App version |
 | `hasConsent` | grant | Return `false` to block init; `optOut()` always wins |
 | `flushInterval` | 5 s | Background flush is additional |
+| `captureCrashes` | `true` | Uncaught Objective-C exceptions become `fatal` events, stored at once and sent on next launch. Chains to an earlier handler |
+
+## Delivery and retries
+
+- Unsent events are written to storage (debounced, at most 100) and loaded on
+  the next `start`. A flush removes only what the server accepted.
+- 2xx: sent. **400 / 413**: the batch is dropped (the server will never take
+  it). **429, 5xx, network errors**: requeued, and the next attempt waits
+  5 s, 10 s, 20 s… up to 5 minutes; a success resets the wait.
+- The Next BFF at `/api/v1/roboboro/ingest` returns a non-2xx status (502)
+  when sublime-go rejects or fails, so those events are retried, not lost.
+- Backgrounding the app starts a flush inside a background task.
+- `flush()` is single-flight: concurrent callers share one send.
+
+## Crash capture limits
+
+Only uncaught `NSException`s are recorded. Swift runtime traps
+(`fatalError`, force-unwrap of `nil`, array bounds) and signals such as
+SIGSEGV are not: a signal handler may only call async-signal-safe
+functions, and building an event is not one. Pair with a crash reporter if
+you need those.
 
 ## Relation to p1-roboboro-tracker
 
@@ -92,8 +117,8 @@ RoboboroTracker.shared.optOut()
 |---------|-----------|-------------|
 | Storage | AsyncStorage | UserDefaults |
 | App lifecycle | AppState | `UIApplication` background |
-| Ingest | `fetch` → `/ingest` | `URLSession` → `/ingest` (2xx only) |
-| IDs / fingerprint | `core.ts` / `server.ts` | `Core.swift` (same `rb_` ids, SHA-256-16) |
+| Ingest | `fetch` → `/ingest` | `URLSession` → `/ingest` (2xx only, backoff) |
+| IDs / fingerprint | `core.ts` / `server.ts` | `Core.swift` (same `rb_` ids, SHA-256-16; exceptions keyed by domain#code, not the translated message) |
 | Vitals | no-op | no-op |
 
 ## Privacy
