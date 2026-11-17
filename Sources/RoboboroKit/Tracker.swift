@@ -38,7 +38,7 @@ public final class RoboboroTracker: @unchecked Sendable {
     private var user: RoboboroUser?
     private var screen: String?
     private var flushTimer: Timer?
-    private var flushTask: Task<Void, Never>?
+    private var flushTask: Task<RoboboroFlushResult, Never>?
     private var persistScheduled = false
     private var consecutiveFailures = 0
     private var nextAttemptAt: Date?
@@ -50,7 +50,9 @@ public final class RoboboroTracker: @unchecked Sendable {
 
     private let persistQueue = DispatchQueue(label: "roboboro.persist")
 
-    init() {}
+    /// A tracker of your own, apart from `shared`. A test runner uses one so its results never mix with the
+    /// app's events, even when tests run inside the app. Crash capture stays with `shared`.
+    public init() {}
 
     // MARK: Lifecycle
 
@@ -71,13 +73,9 @@ public final class RoboboroTracker: @unchecked Sendable {
         let apiBase = config.apiBase.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !siteId.isEmpty, !apiBase.isEmpty else { return nil }
 
-#if canImport(UIKit) && !os(watchOS)
-        let version = await MainActor.run { UIDevice.current.systemVersion }
-        let os = await MainActor.run { UIDevice.current.userInterfaceIdiom == .pad ? "ipados" : "ios" }
-#else
-        let version = ProcessInfo.processInfo.operatingSystemVersionString
-        let os = "macos"
-#endif
+        // Read without the main actor: a test observer calls `start` while the main thread waits for it.
+        let version = RoboboroDevice.systemVersion
+        let os = RoboboroDevice.osName
 
         enum Outcome { case alreadyRunning, rejected, started }
         let outcome: Outcome = withLock {
@@ -115,20 +113,25 @@ public final class RoboboroTracker: @unchecked Sendable {
         case .started: break
         }
 
-        if config.captureCrashes {
+        // The uncaught-exception handler records on `shared`, so only `shared` installs it.
+        if config.captureCrashes && self === RoboboroTracker.shared {
             RoboboroCrashCapture.install()
         }
 
-        let visitor = withLock { ensureVisitorLocked() }
-        push(type: .session, message: "session_start", extra: [
-            "os": .string(os),
-            "system_version": .string(version),
-            "storage_persistent": .bool(withLock { storage.isPersistent }),
-            "visitor_id": .string(visitor),
-        ])
+        if config.sendsSessionStart {
+            let visitor = withLock { ensureVisitorLocked() }
+            push(type: .session, message: "session_start", extra: [
+                "os": .string(os),
+                "system_version": .string(version),
+                "storage_persistent": .bool(withLock { storage.isPersistent }),
+                "visitor_id": .string(visitor),
+            ])
+        }
 
         startTimer()
-        observeAppLifecycle()
+        if config.observesAppLifecycle {
+            observeAppLifecycle()
+        }
         return self
     }
 
@@ -237,7 +240,11 @@ public final class RoboboroTracker: @unchecked Sendable {
         }
     }
 
+    /// One test's outcome. The fingerprint is the test name, so a test keeps one row across runs.
     public func captureTestResult(_ result: RoboboroTestResultInput) {
+        var data = result.data ?? [:]
+        if result.flaky { data["flaky"] = .bool(true) }
+        if let attempts = result.attempts { data["attempts"] = .number(Double(attempts)) }
         push(
             type: .testResult,
             message: result.testName,
@@ -247,9 +254,10 @@ public final class RoboboroTracker: @unchecked Sendable {
             status: result.status,
             durationMs: result.durationMs,
             fingerprint: RoboboroIDs.fingerprint(result.testName),
-            extra: nil,
+            extra: data.isEmpty ? nil : data,
             runId: result.runId,
-            videoUrl: result.videoUrl
+            videoUrl: result.videoUrl,
+            source: result.source
         )
     }
 
@@ -303,29 +311,38 @@ public final class RoboboroTracker: @unchecked Sendable {
 
     // MARK: Flush
 
-    public func flush() async {
-        let task: Task<Void, Never> = withLock {
+    /// Sends what is queued, in chunks of at most 50 (the server's limit). Concurrent callers share one send
+    /// and one result. A failed chunk stops the flush, stays queued, and waits out a growing backoff.
+    @discardableResult
+    public func flush() async -> RoboboroFlushResult {
+        let task: Task<RoboboroFlushResult, Never> = withLock {
             if let existing = flushTask { return existing }
-            let created = Task { [weak self] in
-                guard let self else { return }
-                await self.flushOnce()
+            let created = Task { [weak self] () -> RoboboroFlushResult in
+                guard let self else { return .nothing }
+                return await self.flushOnce()
             }
             flushTask = created
             return created
         }
-        await task.value
+        let result = await task.value
         withLock {
             if flushTask == task { flushTask = nil }
         }
+        return result
     }
 
-    private func flushOnce() async {
-        guard let (snapshot, cfg) = takeBatch() else { return }
+    private func flushOnce() async -> RoboboroFlushResult {
+        guard let (snapshot, cfg) = takeBatch() else {
+            return RoboboroFlushResult(pending: pendingCount)
+        }
         guard let url = URL(string: RoboboroURL.ingest(cfg.apiBase)) else {
             requeueInFlight(failed: true)
-            return
+            return RoboboroFlushResult(pending: pendingCount, failure: "bad apiBase")
         }
 
+        var sent = 0
+        var dropped = 0
+        var failure: String?
         var remaining = snapshot
         while !remaining.isEmpty {
             let n = min(RoboboroCore.maxBatchSize, remaining.count)
@@ -346,6 +363,8 @@ public final class RoboboroTracker: @unchecked Sendable {
                 // Cannot be encoded now, cannot be encoded later.
                 remaining.removeFirst(n)
                 acknowledge(chunk)
+                dropped += n
+                failure = "could not encode"
                 continue
             }
             do {
@@ -353,17 +372,26 @@ public final class RoboboroTracker: @unchecked Sendable {
                 remaining.removeFirst(n)
                 acknowledge(chunk)
                 resetBackoff()
+                sent += n
             } catch {
                 if RoboboroRetry.isPermanent(error) {
                     // 400 / 413: the server will never take this chunk.
                     remaining.removeFirst(n)
                     acknowledge(chunk)
+                    dropped += n
+                    failure = RoboboroRetry.describe(error)
                     continue
                 }
                 requeueInFlight(failed: true)
-                return
+                return RoboboroFlushResult(sent: sent, dropped: dropped, pending: pendingCount, failure: RoboboroRetry.describe(error))
             }
         }
+        return RoboboroFlushResult(sent: sent, dropped: dropped, pending: pendingCount, failure: failure)
+    }
+
+    /// Events not yet accepted: queued and in flight.
+    public var pendingCount: Int {
+        withLock { queue.count + inFlight.count }
     }
 
     // MARK: Internals
@@ -465,7 +493,8 @@ public final class RoboboroTracker: @unchecked Sendable {
         fingerprint: String? = nil,
         extra: [String: RoboboroJSON]? = nil,
         runId: String? = nil,
-        videoUrl: String? = nil
+        videoUrl: String? = nil,
+        source: String? = nil
     ) {
         let pushed: Bool = withLock {
             guard active && !destroyed && !optedOut, let cfg = config else { return false }
@@ -482,7 +511,8 @@ public final class RoboboroTracker: @unchecked Sendable {
                 fingerprint: fingerprint,
                 extra: extra,
                 runId: runId,
-                videoUrl: videoUrl
+                videoUrl: videoUrl,
+                source: source
             )
             appendLocked(event)
             return true
@@ -504,7 +534,8 @@ public final class RoboboroTracker: @unchecked Sendable {
         fingerprint: String?,
         extra: [String: RoboboroJSON]?,
         runId: String?,
-        videoUrl: String?
+        videoUrl: String?,
+        source: String? = nil
     ) -> RoboboroEvent {
         RoboboroEvent(
             eventId: RoboboroIDs.generateId(),
@@ -530,7 +561,8 @@ public final class RoboboroTracker: @unchecked Sendable {
             screen: screen,
             url: nil,
             pathname: nil,
-            data: extra
+            data: extra,
+            source: source
         )
     }
 
@@ -697,6 +729,43 @@ enum RoboboroCrashCapture {
     static func handle(_ exception: NSException) {
         RoboboroTracker.shared.recordUncaughtException(exception)
         previous?(exception)
+    }
+}
+
+/// What the tracker says about the device, read off the main thread.
+public enum RoboboroDevice {
+    /// `27.3`.
+    public static var systemVersion: String {
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        return v.patchVersion == 0 ? "\(v.majorVersion).\(v.minorVersion)" : "\(v.majorVersion).\(v.minorVersion).\(v.patchVersion)"
+    }
+
+    /// `iPhone18,2`. On a simulator, the simulated model.
+    public static var model: String {
+        if let simulated = ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"], !simulated.isEmpty {
+            return simulated
+        }
+        var size = 0
+        sysctlbyname("hw.machine", nil, &size, nil, 0)
+        guard size > 0 else { return "unknown" }
+        var bytes = [CChar](repeating: 0, count: size)
+        sysctlbyname("hw.machine", &bytes, &size, nil, 0)
+        return String(cString: bytes)
+    }
+
+    /// `ios`, `ipados`, `macos`, `tvos`, or `watchos`.
+    public static var osName: String {
+#if os(iOS)
+        return model.hasPrefix("iPad") ? "ipados" : "ios"
+#elseif os(macOS)
+        return "macos"
+#elseif os(tvOS)
+        return "tvos"
+#elseif os(watchOS)
+        return "watchos"
+#else
+        return "unknown"
+#endif
     }
 }
 

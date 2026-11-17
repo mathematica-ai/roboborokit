@@ -93,6 +93,13 @@ public enum RoboboroRetry {
         if case RoboboroTransportError.badURL = error { return true }
         return false
     }
+
+    /// `http 502`, or the network error's own words, for a log line.
+    public static func describe(_ error: Error) -> String {
+        if case RoboboroTransportError.http(let status) = error { return "http \(status)" }
+        if case RoboboroTransportError.badURL = error { return "bad URL" }
+        return error.localizedDescription
+    }
 }
 
 public enum RoboboroPost {

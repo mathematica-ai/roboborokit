@@ -36,7 +36,7 @@ git@github.com-math:mathematica-ai/roboborokit.git
 
 ```swift
 dependencies: [
-  .package(url: "git@github.com-math:mathematica-ai/roboborokit.git", from: "0.2.0"),
+  .package(url: "git@github.com-math:mathematica-ai/roboborokit.git", from: "0.3.0"),
 ],
 targets: [
   .target(name: "YourApp", dependencies: ["RoboboroKit"]),
@@ -89,7 +89,9 @@ sets the `screen` carried by later events.
 | `release` | — | App version |
 | `hasConsent` | grant | Return `false` to block init; `optOut()` always wins |
 | `flushInterval` | 5 s | Background flush is additional |
-| `captureCrashes` | `true` | Uncaught Objective-C exceptions become `fatal` events, stored at once and sent on next launch. Chains to an earlier handler |
+| `captureCrashes` | `true` | Uncaught Objective-C exceptions become `fatal` events, stored at once and sent on next launch. Chains to an earlier handler. Only `shared` installs it |
+| `sendsSessionStart` | `true` | A `session_start` event with a stable `visitor_id` (`rbv_…`) for the install. Not an account or an email |
+| `observesAppLifecycle` | `true` | Flush in a background task when the app goes to the background |
 
 ## Delivery and retries
 
@@ -101,7 +103,76 @@ sets the `screen` carried by later events.
 - The Next BFF at `/api/v1/roboboro/ingest` returns a non-2xx status (502)
   when sublime-go rejects or fails, so those events are retried, not lost.
 - Backgrounding the app starts a flush inside a background task.
-- `flush()` is single-flight: concurrent callers share one send.
+- `flush()` is single-flight: concurrent callers share one send. It returns a
+  `RoboboroFlushResult`: how many events were `sent`, `dropped` (400 / 413),
+  and still `pending`, and the last `failure` (`http 502`, or the network
+  error). A batch is on disk before its post, so a kill mid-send loses nothing.
+- Batches are at most 50 events, the server's limit.
+- The default session is ephemeral: no cookies, no cache, and a redirect is
+  followed only on https to the same host.
+
+## Test results (XCTest)
+
+Link the `RoboboroXCTest` product from a test bundle (never from the app) and
+make its observer the bundle's principal class. Every test's outcome goes to
+Roboboro as a `test_result`, the way p1-website's Playwright reporter does:
+
+```yaml
+# XcodeGen
+AppUITests:
+  dependencies:
+    - package: RoboboroKit
+      product: RoboboroXCTest
+  info:
+    properties:
+      NSPrincipalClass: RoboboroXCTest.RoboboroXCTestObserver
+      RoboboroAPIBase: https://www.principia1.com/api/v1/roboboro
+      RoboboroOrganisationSlug: principia-one
+```
+
+It stays off until the runner has a site id. xcodebuild hands the runner every
+variable prefixed `TEST_RUNNER_`, without the prefix:
+
+```bash
+TEST_RUNNER_ROBOBORO_SITE_ID=site_… TEST_RUNNER_ROBOBORO_RUN_ID=$GITHUB_RUN_ID \
+  xcodebuild test -scheme AppUITests -destination 'platform=iOS Simulator,name=iPhone 18 Pro Max'
+```
+
+| Setting | Environment | Info.plist |
+|---|---|---|
+| site id | `ROBOBORO_SITE_ID` | `RoboboroSiteID` |
+| API base | `ROBOBORO_API_BASE` | `RoboboroAPIBase` |
+| API key | `ROBOBORO_API_KEY` | never |
+| organisation | `ROBOBORO_ORGANISATION_SLUG` | `RoboboroOrganisationSlug` |
+| environment | `ROBOBORO_ENVIRONMENT`, else `ci` when `CI` is set, else `local` | |
+| run id | `ROBOBORO_RUN_ID`, else `GITHUB_RUN_ID`, else a new UUID | |
+| release | `ROBOBORO_RELEASE`, else the bundle's version and build | |
+| name prefix | `ROBOBORO_NAME_PREFIX` | `RoboboroNamePrefix`, else `iOS` |
+
+What it sends:
+
+- One row per test. `-[HomeJourneyTests testScrubbingShowsThatDay]` reads as
+  `iOS › HomeJourneyTests › Scrubbing shows that day`, and that name is the
+  fingerprint, so a test keeps one row across runs.
+- `PASSED`, `FAILED`, or `SKIPPED`, the duration, and for a failure the first
+  issue and where it happened.
+- A test that failed and then passed on a retry is one `PASSED` row with
+  `flaky: true` and `attempts`.
+- `suite`, `device` (the simulated model on a simulator), and `os_version` in
+  `data`.
+- `source: "xctest"`. Roboboro keeps every result from a test source and shows
+  the latest status per test. App telemetry (no source, `roboboro` on the
+  server) only turns failures into issues, so passes sent that way vanish.
+- No `session_start`. The observer uses a tracker of its own, so a hosted unit
+  test never mixes with the app's events.
+
+Each class's results are sent when the class finishes, so a runner that dies
+later has still reported what finished. The run ends with one line in the
+log, for example `Roboboro: 8 of 8 results sent to www.principia1.com, run
+1234, ci.`
+
+`RoboboroTracker()` makes a tracker of your own for anything else that must
+stay apart from `shared`.
 
 ## Crash capture limits
 
@@ -133,6 +204,9 @@ you need those.
 cd roboborokit
 swift test
 ```
+
+`RoboboroXCTestTests` runs sample tests under the observer, including ones
+that fail on purpose. Their failures print in the log but are not the suite's.
 
 ## License
 

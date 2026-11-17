@@ -34,6 +34,15 @@ public struct RoboboroTestResultInput: Sendable {
     public var trace: String?
     public var videoUrl: String?
     public var runId: String?
+    /// Who ran the test. Roboboro lists every result from a test source (passes included) and keeps the
+    /// latest status per test, the way it does for Playwright. Only `roboboro` itself hides passes.
+    public var source: String
+    /// Failed, then passed on a retry. The last attempt's status wins.
+    public var flaky: Bool
+    /// How many times it ran in this run, retries included.
+    public var attempts: Int?
+    /// Up to 24 flat values (string, number, bool) the server keeps with the result.
+    public var data: [String: RoboboroJSON]?
 
     public init(
         testName: String,
@@ -42,7 +51,11 @@ public struct RoboboroTestResultInput: Sendable {
         error: String? = nil,
         trace: String? = nil,
         videoUrl: String? = nil,
-        runId: String? = nil
+        runId: String? = nil,
+        source: String = RoboboroSource.xctest,
+        flaky: Bool = false,
+        attempts: Int? = nil,
+        data: [String: RoboboroJSON]? = nil
     ) {
         self.testName = testName
         self.status = status
@@ -51,7 +64,40 @@ public struct RoboboroTestResultInput: Sendable {
         self.trace = trace
         self.videoUrl = videoUrl
         self.runId = runId
+        self.source = source
+        self.flaky = flaky
+        self.attempts = attempts
+        self.data = data
     }
+}
+
+/// Values for an event's `source`. The server treats `roboboro` as app telemetry (only failures become issues)
+/// and any test source like Playwright (every result counts, latest status per test).
+public enum RoboboroSource {
+    public static let roboboro = "roboboro"
+    public static let xctest = "xctest"
+    public static let playwright = "playwright"
+}
+
+/// What one `flush()` did. Several callers flushing at once share one result.
+public struct RoboboroFlushResult: Sendable, Equatable {
+    /// Events the server accepted.
+    public var sent: Int
+    /// Events the server will never take (400 or 413), or that could not be encoded.
+    public var dropped: Int
+    /// Events still waiting: unsent after a failure, waiting out a backoff, or pushed during the flush.
+    public var pending: Int
+    /// Why the last attempt failed, when it did. `http 502`, or the network error's description.
+    public var failure: String?
+
+    public init(sent: Int = 0, dropped: Int = 0, pending: Int = 0, failure: String? = nil) {
+        self.sent = sent
+        self.dropped = dropped
+        self.pending = pending
+        self.failure = failure
+    }
+
+    public static let nothing = RoboboroFlushResult()
 }
 
 public struct RoboboroEvent: Codable, Sendable, Equatable {
@@ -79,6 +125,8 @@ public struct RoboboroEvent: Codable, Sendable, Equatable {
     public var url: String?
     public var pathname: String?
     public var data: [String: RoboboroJSON]?
+    /// Nil is app telemetry (`roboboro` on the server).
+    public var source: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case eventId = "event_id"
@@ -92,7 +140,7 @@ public struct RoboboroEvent: Codable, Sendable, Equatable {
         case durationMs = "duration_ms"
         case error, trace
         case videoUrl = "video_url"
-        case environment, platform, release, level, message, user, breadcrumbs, screen, url, pathname, data
+        case environment, platform, release, level, message, user, breadcrumbs, screen, url, pathname, data, source
     }
 }
 
@@ -130,6 +178,10 @@ public struct RoboboroConfig: Sendable {
     /// Record uncaught Objective-C exceptions as `.fatal` events, stored and
     /// sent on next launch. Chains to any handler already installed.
     public var captureCrashes: Bool
+    /// Send a `session_start` event when tracking starts. A test runner turns this off: it is not a person.
+    public var sendsSessionStart: Bool
+    /// Watch for the app going to the background and flush then. Off for a tracker that is not the app's.
+    public var observesAppLifecycle: Bool
 
     public init(
         siteId: String,
@@ -140,7 +192,9 @@ public struct RoboboroConfig: Sendable {
         release: String? = nil,
         hasConsent: (@Sendable (RoboboroPrivacySignals) -> Bool)? = nil,
         flushInterval: TimeInterval = RoboboroCore.defaultFlushInterval,
-        captureCrashes: Bool = true
+        captureCrashes: Bool = true,
+        sendsSessionStart: Bool = true,
+        observesAppLifecycle: Bool = true
     ) {
         self.siteId = siteId
         self.apiBase = apiBase
@@ -151,6 +205,8 @@ public struct RoboboroConfig: Sendable {
         self.hasConsent = hasConsent
         self.flushInterval = flushInterval
         self.captureCrashes = captureCrashes
+        self.sendsSessionStart = sendsSessionStart
+        self.observesAppLifecycle = observesAppLifecycle
     }
 }
 

@@ -23,5 +23,5 @@
 /// Do **not** put `P1_API_KEY` in the app binary unless you are talking
 /// straight to sublime-go. Prefer a Next.js BFF that attaches the key.
 public enum RoboboroKitModule {
-    public static let version = "0.2.0"
+    public static let version = "0.3.0"
 }

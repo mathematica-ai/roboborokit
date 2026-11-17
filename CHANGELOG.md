@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.3.0
+
+Test results:
+
+- `RoboboroXCTest`, a new product for test bundles. `RoboboroXCTestObserver`,
+  set as the principal class, sends every XCTest outcome as a `test_result`
+  with a readable name, status, duration, first failure, and where it failed.
+  It is configured from the runner's environment and the bundle's Info.plist,
+  never reads an API key from a plist, and prints one line saying what was sent.
+- A retried test is one row: the last attempt's status, with `flaky` and
+  `attempts`.
+- Test results carry `source` (`xctest` by default). The server only keeps
+  failures from app telemetry, so 0.2.0's test results lost every pass.
+- `RoboboroTestResultInput` takes `source`, `flaky`, `attempts`, and `data`.
+
+Delivery:
+
+- `flush()` returns what it did: sent, dropped, still pending, and the last
+  failure. Existing callers can ignore it.
+- `pendingCount` says how many events are not yet accepted.
+- `start` no longer waits for the main thread, so a caller that blocks the
+  main thread (an XCTest observer) can start a tracker. `RoboboroDevice` reads
+  the system version and model without UIKit.
+- `RoboboroTracker()` is public: a tracker of your own, apart from `shared`.
+  Only `shared` installs crash capture.
+- `sendsSessionStart` and `observesAppLifecycle` can be turned off.
+
+From main, merged with 0.2.0:
+
+- A batch is written to storage before its post, so a kill mid-flight sends it
+  next launch, and an acknowledged batch is never sent twice. (On main, a
+  session event could be sent twice in one batch.)
+- The default session is ephemeral, sends no cookies, and refuses a redirect
+  onto another host or onto http.
+- Session start stores a stable `visitor_id` (`rbv_…`) for this install. It is
+  not an account or an email.
+
 ## 0.2.0
 
 - Crash capture, on by default (`captureCrashes`): an uncaught Objective-C

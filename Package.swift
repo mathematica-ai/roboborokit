@@ -11,6 +11,8 @@ let package = Package(
     ],
     products: [
         .library(name: "RoboboroKit", targets: ["RoboboroKit"]),
+        // Link this from a test bundle only. It imports XCTest.
+        .library(name: "RoboboroXCTest", targets: ["RoboboroXCTest"]),
     ],
     targets: [
         .target(
@@ -18,10 +20,20 @@ let package = Package(
             path: "Sources/RoboboroKit",
             resources: [.process("PrivacyInfo.xcprivacy")]
         ),
+        .target(
+            name: "RoboboroXCTest",
+            dependencies: ["RoboboroKit"],
+            path: "Sources/RoboboroXCTest"
+        ),
         .testTarget(
             name: "RoboboroKitTests",
             dependencies: ["RoboboroKit"],
             path: "Tests/RoboboroKitTests"
+        ),
+        .testTarget(
+            name: "RoboboroXCTestTests",
+            dependencies: ["RoboboroXCTest", "RoboboroKit"],
+            path: "Tests/RoboboroXCTestTests"
         ),
     ]
 )
