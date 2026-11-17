@@ -127,6 +127,9 @@ public struct RoboboroConfig: Sendable {
     public var release: String?
     public var hasConsent: (@Sendable (RoboboroPrivacySignals) -> Bool)?
     public var flushInterval: TimeInterval
+    /// Record uncaught Objective-C exceptions as `.fatal` events, stored and
+    /// sent on next launch. Chains to any handler already installed.
+    public var captureCrashes: Bool
 
     public init(
         siteId: String,
@@ -136,7 +139,8 @@ public struct RoboboroConfig: Sendable {
         environment: String? = nil,
         release: String? = nil,
         hasConsent: (@Sendable (RoboboroPrivacySignals) -> Bool)? = nil,
-        flushInterval: TimeInterval = RoboboroCore.defaultFlushInterval
+        flushInterval: TimeInterval = RoboboroCore.defaultFlushInterval,
+        captureCrashes: Bool = true
     ) {
         self.siteId = siteId
         self.apiBase = apiBase
@@ -146,6 +150,7 @@ public struct RoboboroConfig: Sendable {
         self.release = release
         self.hasConsent = hasConsent
         self.flushInterval = flushInterval
+        self.captureCrashes = captureCrashes
     }
 }
 

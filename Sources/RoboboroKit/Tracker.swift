@@ -17,6 +17,11 @@ import UIKit
 public final class RoboboroTracker: @unchecked Sendable {
     public static let shared = RoboboroTracker()
 
+    /// Longest wait between retries after consecutive failures.
+    static let maxBackoff: TimeInterval = 300
+    /// Delay before the queue is written to storage after a push.
+    static let persistDelay: TimeInterval = 0.5
+
     private let lock = NSLock()
     private var storage: RoboboroStoring = RoboboroUserDefaultsStorage()
     private var transport: RoboboroTransporting = RoboboroURLSessionTransport()
@@ -25,33 +30,48 @@ public final class RoboboroTracker: @unchecked Sendable {
     private var destroyed = false
     private var optedOut = false
 
+    /// Unsent events not yet taken by a flush.
     private var queue: [RoboboroEvent] = []
+    /// Events taken by the running flush and not yet acknowledged.
+    private var inFlight: [RoboboroEvent] = []
     private var breadcrumbs: [RoboboroBreadcrumb] = []
     private var user: RoboboroUser?
     private var screen: String?
     private var flushTimer: Timer?
     private var flushTask: Task<Void, Never>?
+    private var persistScheduled = false
+    private var consecutiveFailures = 0
+    private var nextAttemptAt: Date?
     private var deviceOS: String = "ios"
     private var systemVersion: String?
 
-    private init() {}
+    /// Clock, swappable in tests.
+    var now: @Sendable () -> Date = { Date() }
+
+    private let persistQueue = DispatchQueue(label: "roboboro.persist")
+
+    init() {}
 
     // MARK: Lifecycle
 
     /// Start (or return) the shared tracker. Returns `nil` when siteId / apiBase
     /// is missing, or when consent / opt-out rejects.
+    ///
+    /// Events left unsent by an earlier launch (or an uncaught exception) are
+    /// loaded from storage and sent with the next flush.
     @discardableResult
     public func start(
         config: RoboboroConfig,
         storage customStorage: RoboboroStoring? = nil,
         transport customTransport: RoboboroTransporting? = nil
     ) async -> RoboboroTracker? {
+        if isRunnable { return self }
+
         let siteId = config.siteId.trimmingCharacters(in: .whitespacesAndNewlines)
         let apiBase = config.apiBase.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !siteId.isEmpty, !apiBase.isEmpty else { return nil }
-        if withLock({ active && !destroyed && !optedOut }) { return self }
 
-#if canImport(UIKit)
+#if canImport(UIKit) && !os(watchOS)
         let version = await MainActor.run { UIDevice.current.systemVersion }
         let os = await MainActor.run { UIDevice.current.userInterfaceIdiom == .pad ? "ipados" : "ios" }
 #else
@@ -59,38 +79,51 @@ public final class RoboboroTracker: @unchecked Sendable {
         let os = "macos"
 #endif
 
-        let began: Bool = withLock {
-            if active && !destroyed && !optedOut { return false }
+        enum Outcome { case alreadyRunning, rejected, started }
+        let outcome: Outcome = withLock {
+            if active && !destroyed && !optedOut { return .alreadyRunning }
             if let customStorage { storage = customStorage }
             if let customTransport { transport = customTransport }
+
             var resolved = config
             resolved.siteId = siteId
             resolved.apiBase = apiBase
             self.config = resolved
+
             optedOut = storage.get(RoboboroCore.optOutKey) == "1"
             let signals = RoboboroPrivacySignals(gpc: false, dnt: false, optedOut: optedOut)
             guard RoboboroConsent.granted(signals, hasConsent: config.hasConsent) else {
-                return false
+                return .rejected
             }
+
             destroyed = false
             active = true
-            queue = []
+            queue = loadPending()
+            inFlight = []
             breadcrumbs = []
             user = nil
             screen = nil
+            consecutiveFailures = 0
+            nextAttemptAt = nil
             deviceOS = os
             systemVersion = version
-            return true
+            return .started
         }
-        guard began else {
-            return withLock { active && !destroyed && !optedOut } ? self : nil
+        switch outcome {
+        case .alreadyRunning: return self
+        case .rejected: return nil
+        case .started: break
         }
 
-        let visitor = ensureVisitor()
+        if config.captureCrashes {
+            RoboboroCrashCapture.install()
+        }
+
+        let visitor = withLock { ensureVisitorLocked() }
         push(type: .session, message: "session_start", extra: [
-            "os": .string(deviceOS),
-            "system_version": systemVersion.map { .string($0) } ?? .null,
-            "storage_persistent": .bool(storage.isPersistent),
+            "os": .string(os),
+            "system_version": .string(version),
+            "storage_persistent": .bool(withLock { storage.isPersistent }),
             "visitor_id": .string(visitor),
         ])
 
@@ -99,40 +132,61 @@ public final class RoboboroTracker: @unchecked Sendable {
         return self
     }
 
+    /// Stops tracking and drops the in-memory queue. Events already written
+    /// to storage stay there and are sent after the next `start`.
     public func destroy() {
-        invalidateTimer()
         withLock {
             destroyed = true
             active = false
             queue.removeAll()
+            inFlight.removeAll()
         }
-#if canImport(UIKit)
+        stopTimer()
+#if canImport(UIKit) && !os(watchOS)
         NotificationCenter.default.removeObserver(self)
 #endif
     }
 
     func resetForTests() {
         destroy()
-        lock.lock()
-        storage = RoboboroMemoryStorage()
-        transport = RoboboroURLSessionTransport()
-        config = nil
-        optedOut = false
-        user = nil
-        breadcrumbs = []
-        screen = nil
-        flushTask = nil
-        lock.unlock()
+        persistQueue.sync {}
+        withLock {
+            storage = RoboboroMemoryStorage()
+            transport = RoboboroURLSessionTransport()
+            config = nil
+            optedOut = false
+            user = nil
+            breadcrumbs = []
+            screen = nil
+            flushTask = nil
+            persistScheduled = false
+            consecutiveFailures = 0
+            nextAttemptAt = nil
+        }
+        now = { Date() }
     }
 
+    /// Stops tracking, drops queued and stored events, and remembers the
+    /// choice across launches.
     public func optOut() {
-        storage.set(RoboboroCore.optOutKey, "1")
-        storage.remove(RoboboroCore.pendingBufferKey)
         withLock {
+            storage.set(RoboboroCore.optOutKey, "1")
+            storage.remove(RoboboroCore.pendingBufferKey)
             optedOut = true
+            active = false
             queue.removeAll()
+            inFlight.removeAll()
         }
-        invalidateTimer()
+        stopTimer()
+    }
+
+    /// Clears a stored opt-out. Tracking does not resume by itself: call
+    /// `start(config:)` again to become active.
+    public func optIn() {
+        withLock {
+            storage.remove(RoboboroCore.optOutKey)
+            optedOut = false
+        }
     }
 
     // MARK: Tracking API
@@ -140,7 +194,7 @@ public final class RoboboroTracker: @unchecked Sendable {
     public func captureException(_ error: Error, extra: [String: Any]? = nil) {
         let message = RoboboroErrorFields.message(from: error)
         var data = extra.map { $0.mapValues { RoboboroJSON.from($0) } } ?? [:]
-        data["os"] = .string(deviceOS)
+        data["os"] = .string(withLock { deviceOS })
         push(
             type: .exception,
             message: message,
@@ -149,7 +203,7 @@ public final class RoboboroTracker: @unchecked Sendable {
             trace: RoboboroErrorFields.trace(from: error),
             testName: message,
             status: .FAILED,
-            fingerprint: RoboboroIDs.fingerprint(message),
+            fingerprint: RoboboroIDs.fingerprint(RoboboroErrorFields.fingerprintKey(from: error)),
             extra: data
         )
     }
@@ -162,25 +216,25 @@ public final class RoboboroTracker: @unchecked Sendable {
     }
 
     public func addBreadcrumb(category: String, message: String, data: [String: Any]? = nil) {
-        guard isRunnable else { return }
         let crumb = RoboboroBreadcrumb(
             ts: nowMs(),
             category: category,
             message: message,
             data: data.map { $0.mapValues { RoboboroJSON.from($0) } }
         )
-        lock.lock()
-        breadcrumbs.append(crumb)
-        if breadcrumbs.count > 50 {
-            breadcrumbs = Array(breadcrumbs.suffix(50))
+        withLock {
+            guard active && !destroyed && !optedOut else { return }
+            breadcrumbs.append(crumb)
+            if breadcrumbs.count > 50 {
+                breadcrumbs = Array(breadcrumbs.suffix(50))
+            }
         }
-        lock.unlock()
     }
 
     public func identify(userId: String, traits: RoboboroUser? = nil) {
-        lock.lock()
-        user = RoboboroUser(id: userId, email: traits?.email, name: traits?.name)
-        lock.unlock()
+        withLock {
+            user = RoboboroUser(id: userId, email: traits?.email, name: traits?.name)
+        }
     }
 
     public func captureTestResult(_ result: RoboboroTestResultInput) {
@@ -199,50 +253,83 @@ public final class RoboboroTracker: @unchecked Sendable {
         )
     }
 
+    /// Sets the current screen and adds a `navigation` breadcrumb. Sends no
+    /// event of its own: the screen rides along on the next event.
     public func trackScreen(_ name: String) {
         guard isRunnable else { return }
-        lock.lock()
-        screen = name
-        lock.unlock()
+        withLock { screen = name }
         addBreadcrumb(category: "navigation", message: name)
-        push(type: .session, message: "screen", extra: nil)
+    }
+
+    // MARK: Crash capture
+
+    /// Records an uncaught exception as a `.fatal` exception event and writes
+    /// the queue to storage before returning, so it is sent on next launch.
+    /// Called from the uncaught-exception handler; never blocks for long.
+    func recordUncaughtException(_ exception: NSException) {
+        let name = exception.name.rawValue
+        let reason = exception.reason ?? ""
+        let message = reason.isEmpty ? name : "\(name): \(reason)"
+        let trace = exception.callStackSymbols.joined(separator: "\n")
+        let key = name + "#" + RoboboroErrorFields.stripVolatile(reason)
+
+        // The crash may have happened while this thread held the lock, or
+        // another thread may hold it forever. Wait briefly, then give up.
+        guard lock.lock(before: Date().addingTimeInterval(0.5)) else { return }
+        defer { lock.unlock() }
+        guard active && !destroyed && !optedOut, let cfg = config else { return }
+        let event = makeEvent(
+            cfg: cfg,
+            type: .exception,
+            message: message,
+            level: .fatal,
+            error: message,
+            trace: trace.isEmpty ? nil : trace,
+            testName: message,
+            status: .FAILED,
+            durationMs: nil,
+            fingerprint: RoboboroIDs.fingerprint(key),
+            extra: [
+                "os": .string(deviceOS),
+                "crash": .bool(true),
+                "exception_name": .string(name),
+            ],
+            runId: nil,
+            videoUrl: nil
+        )
+        appendLocked(event)
+        writePendingLocked()
     }
 
     // MARK: Flush
 
     public func flush() async {
-        if let existing = currentFlushTask() {
-            await existing.value
-            return
+        let task: Task<Void, Never> = withLock {
+            if let existing = flushTask { return existing }
+            let created = Task { [weak self] in
+                guard let self else { return }
+                await self.flushOnce()
+            }
+            flushTask = created
+            return created
         }
-        let task = Task { [weak self] in
-            guard let self else { return }
-            await self.flushOnce()
-        }
-        setFlushTask(task)
         await task.value
-        setFlushTask(nil)
+        withLock {
+            if flushTask == task { flushTask = nil }
+        }
     }
 
     private func flushOnce() async {
-        let prepared: (events: [RoboboroEvent], config: RoboboroConfig?) = drainQueue()
-        let snapshot = prepared.events
-        let cfg = prepared.config
-        guard let cfg, !snapshot.isEmpty else { return }
-        // Opt-out wins over a batch that was already taken off the queue.
-        guard !isOptedOut else { return }
+        guard let (snapshot, cfg) = takeBatch() else { return }
         guard let url = URL(string: RoboboroURL.ingest(cfg.apiBase)) else {
-            requeue(snapshot)
+            requeueInFlight(failed: true)
             return
         }
 
         var remaining = snapshot
         while !remaining.isEmpty {
-            guard !isOptedOut else { return }
             let n = min(RoboboroCore.maxBatchSize, remaining.count)
             let chunk = Array(remaining.prefix(n))
-            // Written before the request, so a kill mid-flight retries next launch.
-            savePending(remaining)
             let payload = RoboboroBatch(
                 siteId: cfg.siteId,
                 organisationSlug: cfg.organisationSlug,
@@ -252,17 +339,28 @@ public final class RoboboroTracker: @unchecked Sendable {
                 release: cfg.release,
                 batch: chunk
             )
+            let body: Data
             do {
-                let body = try RoboboroPost.encode(batch: payload)
+                body = try RoboboroPost.encode(batch: payload)
+            } catch {
+                // Cannot be encoded now, cannot be encoded later.
+                remaining.removeFirst(n)
+                acknowledge(chunk)
+                continue
+            }
+            do {
                 try await transport.send(url: url, apiKey: cfg.apiKey, body: body)
                 remaining.removeFirst(n)
-                if remaining.isEmpty {
-                    clearPending()
-                } else {
-                    savePending(remaining)
-                }
+                acknowledge(chunk)
+                resetBackoff()
             } catch {
-                if !isOptedOut { requeue(remaining) }
+                if RoboboroRetry.isPermanent(error) {
+                    // 400 / 413: the server will never take this chunk.
+                    remaining.removeFirst(n)
+                    acknowledge(chunk)
+                    continue
+                }
+                requeueInFlight(failed: true)
                 return
             }
         }
@@ -278,27 +376,60 @@ public final class RoboboroTracker: @unchecked Sendable {
         return body()
     }
 
-    private func currentFlushTask() -> Task<Void, Never>? {
-        withLock { flushTask }
-    }
-
-    private func setFlushTask(_ task: Task<Void, Never>?) {
-        withLock { flushTask = task }
-    }
-
-    private func drainQueue() -> ([RoboboroEvent], RoboboroConfig?) {
+    /// Moves the queue into `inFlight`, unless a backoff is pending.
+    private func takeBatch() -> ([RoboboroEvent], RoboboroConfig)? {
         withLock {
-            let pending = loadPending()
-            if !pending.isEmpty {
-                clearPending()
-                queue = pending + queue
-                if queue.count > RoboboroCore.maxPending {
-                    queue = Array(queue.suffix(RoboboroCore.maxPending))
-                }
-            }
-            let snapshot = queue
+            guard let cfg = config, !optedOut else { return nil }
+            if let next = nextAttemptAt, now() < next { return nil }
+            guard !queue.isEmpty else { return nil }
+            inFlight = queue
             queue = []
-            return (snapshot, config)
+            // On disk before the post, so a kill mid-flight sends it next launch.
+            writePendingLocked()
+            return (inFlight, cfg)
+        }
+    }
+
+    /// Removes sent (or permanently rejected) events and writes what is left.
+    private func acknowledge(_ chunk: [RoboboroEvent]) {
+        let ids = Set(chunk.map(\.eventId))
+        withLock {
+            inFlight.removeAll { ids.contains($0.eventId) }
+            writePendingLocked()
+        }
+    }
+
+    private func requeueInFlight(failed: Bool) {
+        withLock {
+            queue = inFlight + queue
+            inFlight = []
+            if queue.count > RoboboroCore.maxPending {
+                queue = Array(queue.suffix(RoboboroCore.maxPending))
+            }
+            if failed {
+                consecutiveFailures += 1
+                let delay = min(
+                    Self.maxBackoff,
+                    RoboboroCore.defaultFlushInterval * pow(2, Double(consecutiveFailures - 1))
+                )
+                nextAttemptAt = now().addingTimeInterval(delay)
+            }
+            writePendingLocked()
+        }
+    }
+
+    private func resetBackoff() {
+        withLock {
+            consecutiveFailures = 0
+            nextAttemptAt = nil
+        }
+    }
+
+    /// Seconds until the next flush may send, or `nil` when none is pending.
+    var backoffRemaining: TimeInterval? {
+        withLock {
+            guard let next = nextAttemptAt else { return nil }
+            return max(0, next.timeIntervalSince(now()))
         }
     }
 
@@ -306,12 +437,8 @@ public final class RoboboroTracker: @unchecked Sendable {
         withLock { active && !destroyed && !optedOut }
     }
 
-    private var isOptedOut: Bool {
-        withLock { optedOut }
-    }
-
-    /// Stable device id for this install. Not an account, and not an email.
-    private func ensureVisitor() -> String {
+    /// Caller holds the lock. A stable id for this install. Not an account, and not an email.
+    private func ensureVisitorLocked() -> String {
         if let existing = storage.get(RoboboroCore.visitorKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !existing.isEmpty {
@@ -323,7 +450,7 @@ public final class RoboboroTracker: @unchecked Sendable {
     }
 
     private func nowMs() -> Int64 {
-        Int64(Date().timeIntervalSince1970 * 1000)
+        Int64(now().timeIntervalSince1970 * 1000)
     }
 
     private func push(
@@ -340,9 +467,46 @@ public final class RoboboroTracker: @unchecked Sendable {
         runId: String? = nil,
         videoUrl: String? = nil
     ) {
-        let event: RoboboroEvent? = withLock {
-        guard active && !destroyed && !optedOut, let cfg = config else { return nil }
-        let event = RoboboroEvent(
+        let pushed: Bool = withLock {
+            guard active && !destroyed && !optedOut, let cfg = config else { return false }
+            let event = makeEvent(
+                cfg: cfg,
+                type: type,
+                message: message,
+                level: level,
+                error: error,
+                trace: trace,
+                testName: testName,
+                status: status,
+                durationMs: durationMs,
+                fingerprint: fingerprint,
+                extra: extra,
+                runId: runId,
+                videoUrl: videoUrl
+            )
+            appendLocked(event)
+            return true
+        }
+        if pushed { schedulePersist() }
+    }
+
+    /// Caller holds the lock.
+    private func makeEvent(
+        cfg: RoboboroConfig,
+        type: RoboboroEventType,
+        message: String?,
+        level: RoboboroLevel?,
+        error: String?,
+        trace: String?,
+        testName: String?,
+        status: RoboboroTestStatus?,
+        durationMs: Int?,
+        fingerprint: String?,
+        extra: [String: RoboboroJSON]?,
+        runId: String?,
+        videoUrl: String?
+    ) -> RoboboroEvent {
+        RoboboroEvent(
             eventId: RoboboroIDs.generateId(),
             type: type,
             ts: nowMs(),
@@ -368,43 +532,64 @@ public final class RoboboroTracker: @unchecked Sendable {
             pathname: nil,
             data: extra
         )
+    }
+
+    /// Caller holds the lock.
+    private func appendLocked(_ event: RoboboroEvent) {
         queue.append(event)
-        if queue.count > RoboboroCore.maxPending {
-            queue = Array(queue.suffix(RoboboroCore.maxPending))
+        let room = max(0, RoboboroCore.maxPending - inFlight.count)
+        if queue.count > room {
+            queue = Array(queue.suffix(room))
         }
-        return event
-        }
-        guard event != nil else { return }
     }
 
-    private func requeue(_ events: [RoboboroEvent]) {
+    /// Debounced write of the unsent events, so a kill loses at most
+    /// `persistDelay` of events.
+    private func schedulePersist() {
+        let shouldSchedule: Bool = withLock {
+            if persistScheduled { return false }
+            persistScheduled = true
+            return true
+        }
+        guard shouldSchedule else { return }
+        persistQueue.asyncAfter(deadline: .now() + Self.persistDelay) { [weak self] in
+            self?.persistNow()
+        }
+    }
+
+    /// Writes the unsent events (in flight + queued) to storage now.
+    func persistNow() {
         withLock {
-            queue = (events + queue)
-            if queue.count > RoboboroCore.maxPending {
-                queue = Array(queue.suffix(RoboboroCore.maxPending))
-            }
-            savePending(queue)
+            persistScheduled = false
+            guard !destroyed else { return }
+            writePendingLocked()
         }
     }
 
+    /// Caller holds the lock. After `destroy` the stored events are left
+    /// alone for the next `start`.
+    private func writePendingLocked() {
+        if destroyed && !optedOut { return }
+        let unsent = inFlight + queue
+        if optedOut || unsent.isEmpty {
+            storage.remove(RoboboroCore.pendingBufferKey)
+            return
+        }
+        let capped = Array(unsent.suffix(RoboboroCore.maxPending))
+        if let data = try? JSONEncoder().encode(capped),
+           let s = String(data: data, encoding: .utf8) {
+            storage.set(RoboboroCore.pendingBufferKey, s)
+        }
+    }
+
+    /// Caller holds the lock.
     private func loadPending() -> [RoboboroEvent] {
         guard let raw = storage.get(RoboboroCore.pendingBufferKey),
               let data = raw.data(using: .utf8),
               let decoded = try? JSONDecoder().decode([RoboboroEvent].self, from: data) else {
             return []
         }
-        return decoded
-    }
-
-    private func savePending(_ events: [RoboboroEvent]) {
-        if let data = try? JSONEncoder().encode(events),
-           let s = String(data: data, encoding: .utf8) {
-            storage.set(RoboboroCore.pendingBufferKey, s)
-        }
-    }
-
-    private func clearPending() {
-        storage.remove(RoboboroCore.pendingBufferKey)
+        return Array(decoded.suffix(RoboboroCore.maxPending))
     }
 
     private func startTimer() {
@@ -418,20 +603,15 @@ public final class RoboboroTracker: @unchecked Sendable {
         }
     }
 
-    private func invalidateTimer() {
-        let work = {
-            self.flushTimer?.invalidate()
-            self.flushTimer = nil
-        }
-        if Thread.isMainThread {
-            work()
-        } else {
-            DispatchQueue.main.sync(execute: work)
+    private func stopTimer() {
+        DispatchQueue.main.async { [weak self] in
+            self?.flushTimer?.invalidate()
+            self?.flushTimer = nil
         }
     }
 
     private func observeAppLifecycle() {
-#if canImport(UIKit)
+#if canImport(UIKit) && !os(watchOS)
         NotificationCenter.default.removeObserver(
             self,
             name: UIApplication.didEnterBackgroundNotification,
@@ -446,33 +626,78 @@ public final class RoboboroTracker: @unchecked Sendable {
 #endif
     }
 
-#if canImport(UIKit)
-    @objc private func didEnterBackground() {
+#if canImport(UIKit) && !os(watchOS)
+    /// Posted on the main thread. Asks for background time so the flush can
+    /// finish, and ends it on completion or expiry.
+    @MainActor @objc private func didEnterBackground() {
         let application = UIApplication.shared
         let box = BackgroundTaskBox()
         box.id = application.beginBackgroundTask(withName: "roboboro.flush") {
-            let ending = box.id
-            box.id = .invalid
+            box.end(application)
+        }
+        Task { [weak self] in
+            await self?.flush()
+            await MainActor.run { box.end(application) }
+        }
+    }
+
+    @MainActor
+    private final class BackgroundTaskBox {
+        var id: UIBackgroundTaskIdentifier = .invalid
+
+        func end(_ application: UIApplication) {
+            let ending = id
+            id = .invalid
             if ending != .invalid {
                 application.endBackgroundTask(ending)
             }
         }
-        Task {
-            await flush()
-            await MainActor.run {
-                let ending = box.id
-                box.id = .invalid
-                if ending != .invalid {
-                    application.endBackgroundTask(ending)
-                }
-            }
-        }
-    }
-
-    private final class BackgroundTaskBox: @unchecked Sendable {
-        var id: UIBackgroundTaskIdentifier = .invalid
     }
 #endif
+}
+
+/// Uncaught Objective-C exception capture. Installed once by `start` when
+/// `captureCrashes` is on; chains to any handler installed before it.
+///
+/// Signals (SIGSEGV, SIGABRT from Swift traps) are not captured: a signal
+/// handler may only call async-signal-safe functions, and encoding an event
+/// is not one.
+enum RoboboroCrashCapture {
+    typealias Handler = @convention(c) (NSException) -> Void
+
+    private static let lock = NSLock()
+    private static var installed = false
+    private static var _previous: Handler?
+
+    /// The handler that was installed before ours (tests may replace it).
+    static var previous: Handler? {
+        get { lock.lock(); defer { lock.unlock() }; return _previous }
+        set { lock.lock(); defer { lock.unlock() }; _previous = newValue }
+    }
+
+    static var isInstalled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return installed
+    }
+
+    static func install() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !installed else { return }
+        installed = true
+        _previous = NSGetUncaughtExceptionHandler()
+        NSSetUncaughtExceptionHandler(handler)
+    }
+
+    static let handler: Handler = { exception in
+        RoboboroCrashCapture.handle(exception)
+    }
+
+    /// Records the exception on the shared tracker, then calls the previous handler.
+    static func handle(_ exception: NSException) {
+        RoboboroTracker.shared.recordUncaughtException(exception)
+        previous?(exception)
+    }
 }
 
 @discardableResult

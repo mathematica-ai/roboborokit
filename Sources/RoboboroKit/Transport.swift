@@ -72,12 +72,26 @@ public final class RoboboroURLSessionTransport: RoboboroTransporting, @unchecked
         guard let http = resp as? HTTPURLResponse else {
             throw RoboboroTransportError.http(0)
         }
-        // 202 (Next BFF) and 2xx from sublime-go are success. Anything else
-        // must requeue — fetch-style "no throw on 500" would drop events.
-        // A refused redirect completes as the original 3xx, which requeues too.
+        // 202 (Next BFF) and 2xx from sublime-go are success. The BFF returns
+        // 502 when sublime-go rejects or fails. A refused redirect completes as
+        // the original 3xx. 400 / 413 are dropped by the tracker; everything
+        // else requeues with backoff.
         guard (200..<300).contains(http.statusCode) else {
             throw RoboboroTransportError.http(http.statusCode)
         }
+    }
+}
+
+/// How a failed send is treated.
+public enum RoboboroRetry {
+    /// 400 and 413 mean the server will never take this chunk: drop it.
+    /// 429, 5xx, and network errors are retried with backoff.
+    public static func isPermanent(_ error: Error) -> Bool {
+        if case RoboboroTransportError.http(let status) = error {
+            return status == 400 || status == 413
+        }
+        if case RoboboroTransportError.badURL = error { return true }
+        return false
     }
 }
 

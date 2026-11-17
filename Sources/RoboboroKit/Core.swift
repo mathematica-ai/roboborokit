@@ -95,6 +95,32 @@ public enum RoboboroErrorFields {
         return String(describing: error)
     }
 
+    /// Locale-independent grouping key, so the same error groups together
+    /// whatever the device language. `NSError`s use `domain#code`; Swift
+    /// errors use the fully qualified type, plus the case name for enums
+    /// (payloads are left out) or the bridged code otherwise.
+    public static func fingerprintKey(from error: Error) -> String {
+        let ns = error as NSError
+        if type(of: error) is NSError.Type {
+            return "\(ns.domain)#\(ns.code)"
+        }
+        let typeName = String(reflecting: type(of: error))
+        if Mirror(reflecting: error).displayStyle == .enum {
+            let described = String(describing: error)
+            let caseName = described.split(separator: "(", maxSplits: 1).first.map(String.init) ?? described
+            return "\(typeName).\(caseName)"
+        }
+        return "\(typeName)#\(ns.code)"
+    }
+
+    /// Drops addresses and numbers (indices, sizes) from an exception reason
+    /// so one bug yields one fingerprint.
+    static func stripVolatile(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: #"0x[0-9a-fA-F]+"#, with: "0x", options: .regularExpression)
+            .replacingOccurrences(of: #"\d+"#, with: "#", options: .regularExpression)
+    }
+
     public static func trace(from error: Error) -> String? {
         let ns = error as NSError
         if let stack = ns.userInfo[NSUnderlyingErrorKey] as? Error {
