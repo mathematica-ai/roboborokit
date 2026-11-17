@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1
+
+- The XCTest observer's closing line counts every result sent during the run.
+  It counted only the final send, so classes that went out earlier on the
+  timer were missing (`6 of 8` when all 8 had arrived).
+- The observer starts a send as soon as each test class finishes, rather than
+  waiting for the 30-second timer.
+- `RoboboroTracker.totals`: events sent and refused since `start`, by every
+  flush, what is still pending, and the latest failure.
+
 ## 0.3.0
 
 Test results:

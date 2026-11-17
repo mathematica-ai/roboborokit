@@ -36,7 +36,7 @@ git@github.com-math:mathematica-ai/roboborokit.git
 
 ```swift
 dependencies: [
-  .package(url: "git@github.com-math:mathematica-ai/roboborokit.git", from: "0.3.0"),
+  .package(url: "https://github.com/mathematica-ai/roboborokit.git", from: "0.3.1"),
 ],
 targets: [
   .target(name: "YourApp", dependencies: ["RoboboroKit"]),

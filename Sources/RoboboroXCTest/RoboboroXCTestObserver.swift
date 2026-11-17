@@ -40,6 +40,8 @@ open class RoboboroXCTestObserver: NSObject, XCTestObservation, @unchecked Senda
     private var order: [String] = []
     private var reporting = false
     private var captured = 0
+    /// The line printed at the end of the run, kept for tests.
+    private(set) var closingLine: String?
 
     struct Outcome {
         var suite: String
@@ -129,14 +131,23 @@ open class RoboboroXCTestObserver: NSObject, XCTestObservation, @unchecked Senda
     open func testSuiteDidFinish(_ testSuite: XCTestSuite) {
         guard testSuite.tests.contains(where: { $0 is XCTestCase }) else { return }
         send(names: Set(testSuite.tests.map(\.name)))
+        guard lock.withLock({ reporting }) else { return }
+        let tracker = self.tracker
+        Task.detached { await tracker.flush() }
     }
 
     open func testBundleDidFinish(_ testBundle: Bundle) {
         send(names: nil)
         guard lock.withLock({ reporting }), let settings else { return }
         let tracker = self.tracker
-        let result = Self.waiting(seconds: 30) { await Self.drain(tracker) }
-        Self.log(Self.summary(result: result, captured: lock.withLock { captured }, settings: settings))
+        // The totals, not the last drain: earlier classes may have gone out on their own flush or the timer.
+        let result = Self.waiting(seconds: 30) { () -> RoboboroFlushResult in
+            _ = await Self.drain(tracker)
+            return tracker.totals
+        }
+        let line = Self.summary(result: result, captured: lock.withLock { captured }, settings: settings)
+        lock.withLock { closingLine = line }
+        Self.log(line)
     }
 
     // MARK: Sending

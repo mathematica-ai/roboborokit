@@ -218,6 +218,24 @@ final class RoboboroXCTestObserverTests: XCTestCase {
         )
     }
 
+    func testTheClosingLineCountsEarlierSends() throws {
+        let transport = RecordingTransport()
+        let observer = observer(transport)
+        observer.testBundleWillStart(Bundle.main)
+        run(#selector(SampleJourneys.testPasses), under: observer)
+        run(#selector(SampleJourneys.testSkips), under: observer)
+        let tracker = observer.tracker
+        // A class finishing, then the timer sending its results before the run ends.
+        observer.testSuiteDidFinish(XCTestSuite(forTestCaseClass: SampleJourneys.self))
+        _ = RoboboroXCTestObserver.waiting(seconds: 5) { await tracker.flush() }
+        run(#selector(SampleJourneys.testFails), under: observer, issue: "Broken for good")
+        observer.testBundleDidFinish(Bundle.main)
+
+        XCTAssertEqual(try transport.events().count, 3)
+        XCTAssertEqual(tracker.totals.sent, 3)
+        XCTAssertEqual(observer.closingLine, "Roboboro: 3 of 3 results sent to example.test, run run-42, ci.")
+    }
+
     func testARefusedSendIsReported() throws {
         let transport = RecordingTransport()
         transport.status = 502

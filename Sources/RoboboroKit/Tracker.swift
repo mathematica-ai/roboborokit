@@ -41,6 +41,9 @@ public final class RoboboroTracker: @unchecked Sendable {
     private var flushTask: Task<RoboboroFlushResult, Never>?
     private var persistScheduled = false
     private var consecutiveFailures = 0
+    private var sentTotal = 0
+    private var droppedTotal = 0
+    private var lastFailure: String?
     private var nextAttemptAt: Date?
     private var deviceOS: String = "ios"
     private var systemVersion: String?
@@ -158,6 +161,9 @@ public final class RoboboroTracker: @unchecked Sendable {
             transport = RoboboroURLSessionTransport()
             config = nil
             optedOut = false
+            sentTotal = 0
+            droppedTotal = 0
+            lastFailure = nil
             user = nil
             breadcrumbs = []
             screen = nil
@@ -319,7 +325,13 @@ public final class RoboboroTracker: @unchecked Sendable {
             if let existing = flushTask { return existing }
             let created = Task { [weak self] () -> RoboboroFlushResult in
                 guard let self else { return .nothing }
-                return await self.flushOnce()
+                let result = await self.flushOnce()
+                self.withLock {
+                    self.sentTotal += result.sent
+                    self.droppedTotal += result.dropped
+                    self.lastFailure = result.failure
+                }
+                return result
             }
             flushTask = created
             return created
@@ -387,6 +399,14 @@ public final class RoboboroTracker: @unchecked Sendable {
             }
         }
         return RoboboroFlushResult(sent: sent, dropped: dropped, pending: pendingCount, failure: failure)
+    }
+
+    /// Everything since `start`: events accepted and refused by every flush, the timer's included, what is
+    /// still pending, and the latest flush's failure.
+    public var totals: RoboboroFlushResult {
+        withLock {
+            RoboboroFlushResult(sent: sentTotal, dropped: droppedTotal, pending: queue.count + inFlight.count, failure: lastFailure)
+        }
     }
 
     /// Events not yet accepted: queued and in flight.
