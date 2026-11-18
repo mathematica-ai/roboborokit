@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.2
+
+- A batch the server accepted is never sent twice. When `destroy()` ran while
+  a send was in flight, the stored copy of that batch was left in place and
+  the next `start` sent it again. The accepted chunk now leaves the stored
+  copy too.
+- No event vanishes at the 100-event cap. The cap counted events already in
+  flight, so with 100 in flight a new event, a crash included, was dropped
+  without a trace. The waiting queue now holds 100 on its own; the oldest
+  waiting event makes room and is counted in `totals.dropped`.
+- Both were found by the test audit (`docs/TEST-AUDIT-2026-11-18.md`) and are
+  covered by `AuditP0Tests`.
+
 ## 0.3.1
 
 - The XCTest observer's closing line counts every result sent during the run.
