@@ -439,11 +439,17 @@ public final class RoboboroTracker: @unchecked Sendable {
     }
 
     /// Removes sent (or permanently rejected) events and writes what is left.
+    /// After `destroy` the in-memory queue is gone but the stored copy is not: the chunk comes out of the
+    /// stored copy too, or the next `start` would send a batch the server already took.
     private func acknowledge(_ chunk: [RoboboroEvent]) {
         let ids = Set(chunk.map(\.eventId))
         withLock {
             inFlight.removeAll { ids.contains($0.eventId) }
-            writePendingLocked()
+            if destroyed && !optedOut {
+                storeLocked(loadPending().filter { !ids.contains($0.eventId) })
+            } else {
+                writePendingLocked()
+            }
         }
     }
 
@@ -452,6 +458,7 @@ public final class RoboboroTracker: @unchecked Sendable {
             queue = inFlight + queue
             inFlight = []
             if queue.count > RoboboroCore.maxPending {
+                droppedTotal += queue.count - RoboboroCore.maxPending
                 queue = Array(queue.suffix(RoboboroCore.maxPending))
             }
             if failed {
@@ -586,12 +593,15 @@ public final class RoboboroTracker: @unchecked Sendable {
         )
     }
 
-    /// Caller holds the lock.
+    /// Caller holds the lock. The waiting queue holds at most `maxPending` events, whatever is in flight, so a
+    /// new event (a crash included) always gets in. The oldest waiting event makes room, and is counted in
+    /// `totals.dropped`, never lost silently.
     private func appendLocked(_ event: RoboboroEvent) {
         queue.append(event)
-        let room = max(0, RoboboroCore.maxPending - inFlight.count)
-        if queue.count > room {
-            queue = Array(queue.suffix(room))
+        if queue.count > RoboboroCore.maxPending {
+            let over = queue.count - RoboboroCore.maxPending
+            queue.removeFirst(over)
+            droppedTotal += over
         }
     }
 
@@ -627,7 +637,16 @@ public final class RoboboroTracker: @unchecked Sendable {
             storage.remove(RoboboroCore.pendingBufferKey)
             return
         }
-        let capped = Array(unsent.suffix(RoboboroCore.maxPending))
+        storeLocked(unsent)
+    }
+
+    /// Caller holds the lock. Writes the newest `maxPending` events, or clears the store when there are none.
+    private func storeLocked(_ events: [RoboboroEvent]) {
+        guard !events.isEmpty else {
+            storage.remove(RoboboroCore.pendingBufferKey)
+            return
+        }
+        let capped = Array(events.suffix(RoboboroCore.maxPending))
         if let data = try? JSONEncoder().encode(capped),
            let s = String(data: data, encoding: .utf8) {
             storage.set(RoboboroCore.pendingBufferKey, s)

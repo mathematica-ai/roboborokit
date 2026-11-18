@@ -83,7 +83,8 @@ public enum RoboboroSource {
 public struct RoboboroFlushResult: Sendable, Equatable {
     /// Events the server accepted.
     public var sent: Int
-    /// Events the server will never take (400 or 413), or that could not be encoded.
+    /// Events the server will never take (400 or 413), or that could not be encoded. In `totals`, also the oldest
+    /// waiting events pushed out at the 100-event cap.
     public var dropped: Int
     /// Events still waiting: unsent after a failure, waiting out a backoff, or pushed during the flush.
     public var pending: Int
